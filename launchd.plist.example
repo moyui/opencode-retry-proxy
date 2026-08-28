@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PLIST-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.example.opencode-retry-proxy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <!-- EDIT: set to your node binary, e.g. /opt/homebrew/bin/node or $(which node) -->
+    <string>/usr/local/bin/node</string>
+    <!-- EDIT: absolute path to proxy.mjs -->
+    <string>/path/to/opencode-retry-proxy/proxy.mjs</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/tmp/opencode-proxy-stdout.log</string>
+  <key>StandardErrorPath</key><string>/tmp/opencode-proxy-stdout.log</string>
+  <!-- EDIT: working directory -->
+  <key>WorkingDirectory</key><string>/path/to/opencode-retry-proxy</string>
+</dict>
+</plist>

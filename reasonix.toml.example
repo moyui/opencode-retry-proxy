@@ -1,0 +1,14 @@
+config_version = 7
+
+[[providers]]
+name        = "local-fixed-responses"
+kind        = "responses"
+base_url    = "http://127.0.0.1:8765/v1"
+# alias is mapped by the proxy to the real upstream model;
+# use the -retry variant to enable the fix, keep the real name as fallback
+models      = ["muse-spark-1.2-retry", "muse-spark-1.2-contributor"]
+api_key_env = "CUSTOM_OPENCODE_AI_API_KEY"
+context_window = 1048576
+supported_efforts = ["none", "minimal", "low", "medium", "high", "xhigh"]
+default_effort    = "xhigh"
+billing_mode = "subscription_equivalent"
