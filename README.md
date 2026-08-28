@@ -1,12 +1,20 @@
+<p align="right">
+  <a href="./README.zh-CN.md">中文</a> | <strong>English</strong>
+</p>
+
 # opencode-retry-proxy
+
+[![Node >= 18](https://img.shields.io/badge/node-%3E%3D18-brightgreen)](https://nodejs.org)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![No deps](https://img.shields.io/badge/deps-zero-blue)](./proxy.mjs)
 
 Transparent local retry proxy for `opencode.ai/zen` Responses API `previous_response_id` expiry (`referenced response not found or expired` → 400).
 
-When the upstream returns `400 referenced response not found or expired`, the proxy strips `previous_response_id`, merges the stored full history for that id, and retries once. On success the session continues transparently.
+When the upstream returns `400 referenced response not found or expired`, the proxy strips `previous_response_id`, merges the stored full history for that id, and retries once. On success the session continues transparently — no client changes needed.
 
 ## Why
 
-Reasonix/Opencode's Responses API uses `previous_response_id` to chain turns server-side. If the upstream evicts that id (idle timeout / rolling window), every subsequent turn fails with:
+Reasonix / Opencode's Responses API chains turns server-side via `previous_response_id`. If the upstream evicts that id (idle timeout / rolling window / deploy), every subsequent turn fails with:
 
 ```json
 {
@@ -17,7 +25,7 @@ Reasonix/Opencode's Responses API uses `previous_response_id` to chain turns ser
 }
 ```
 
-This proxy makes that error self-healing without client changes.
+This proxy makes that error self-healing.
 
 ## Quick start
 
@@ -27,10 +35,10 @@ node proxy.mjs &
 LISTEN_PORT=8765 UPSTREAM=https://opencode.ai/zen/go/v1 node proxy.mjs
 ```
 
-Configure your client to use the proxy instead of the upstream directly:
+Point your client at the proxy instead of the upstream:
 
 ```toml
-# reasonix.toml (example — see reasonix.toml.example)
+# reasonix.toml (see reasonix.toml.example)
 [[providers]]
 name        = "local-fixed-responses"
 kind        = "responses"
@@ -39,9 +47,9 @@ models      = ["muse-spark-1.2-retry", "muse-spark-1.2-contributor"]
 api_key_env = "CUSTOM_OPENCODE_AI_API_KEY"
 ```
 
-Use model `muse-spark-1.2-retry` — the proxy aliases it to `muse-spark-1.2-contributor` upstream and enables the history-merge retry path.
+Use model `muse-spark-1.2-retry` — the proxy aliases it to `muse-spark-1.2-contributor` upstream and enables the history-merge retry path. Using the real model name directly also works, but the alias makes it obvious when the fix is active.
 
-Tail logs:
+Verify:
 
 ```bash
 tail -f /tmp/opencode-retry-proxy.log
@@ -53,7 +61,7 @@ tail -f /tmp/opencode-retry-proxy.log
 
 | Var | Default | Notes |
 |-----|---------|-------|
-| `LISTEN_HOST` | `127.0.0.1` | **Must stay loopback.** Do NOT set to `0.0.0.0` — that would expose an open proxy that forwards your `Authorization` header at anyone's request. |
+| `LISTEN_HOST` | `127.0.0.1` | **Must stay loopback.** Do NOT set to `0.0.0.0` — that would expose an open proxy forwarding your `Authorization` to anyone. |
 | `LISTEN_PORT` | `8765` |  |
 | `UPSTREAM` | `https://opencode.ai/zen/go/v1` | Upstream Responses API base (should end with `/v1`). |
 | `LOG_FILE` | `/tmp/opencode-retry-proxy.log` |  |
@@ -62,7 +70,7 @@ tail -f /tmp/opencode-retry-proxy.log
 ## How it works
 
 1. Forwards every request to `UPSTREAM` verbatim (preserves `Authorization`, `content-type`, streaming).
-2. If the request carried `previous_response_id` and the upstream replied `400` matching `referenced response (not found|expired)` or `previous_response_id not found`, builds a retry body with `previous_response_id` removed and `input` replaced by `history[prevId] + current input`, then `POST`s once.
+2. If the request carried `previous_response_id` and upstream replied `400` matching `referenced response (not found|expired)` or `previous_response_id not found`, builds a retry body with `previous_response_id` removed and `input` replaced by `history[prevId] + current input`, then `POST`s once.
 3. Maintains `history` by sniffing response `id` from both `application/json` and `text/event-stream` (SSE) bodies, merging incremental `input` into the full chain for future retries.
 
 No secrets are logged — only `len`, `id`, `status`, and a 200-char `bodyHint`.
@@ -91,4 +99,4 @@ Or use `start.sh`:
 
 ## License
 
-MIT — see `LICENSE`.
+MIT — see [LICENSE](./LICENSE).
