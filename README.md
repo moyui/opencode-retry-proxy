@@ -30,10 +30,15 @@ This proxy makes that error self-healing.
 ## Quick start
 
 ```bash
-node proxy.mjs &
+# run in background (nohup keeps it alive after the shell exits)
+nohup node proxy.mjs >/dev/null 2>&1 &
 # or with env overrides:
-LISTEN_PORT=8765 UPSTREAM=https://opencode.ai/zen/go/v1 node proxy.mjs
+LISTEN_PORT=8765 UPSTREAM=https://opencode.ai/zen/go/v1 nohup node proxy.mjs >/dev/null 2>&1 &
+# or use the bundled launcher:
+./start.sh
 ```
+
+> If port `8765` is already taken, the proxy exits with an error — pick another port via `LISTEN_PORT`.
 
 Point your client at the proxy instead of the upstream:
 
@@ -57,6 +62,8 @@ tail -f /tmp/opencode-retry-proxy.log
 # retry result: 200 OK
 ```
 
+> Tip: hitting the proxy with a bogus model (`{"model":"test",...}`) returns `ModelError: Model test is not supported` — that is the **proxy forwarding correctly** to the upstream, not a failure.
+
 ## Env
 
 | Var | Default | Notes |
@@ -78,10 +85,17 @@ No secrets are logged — only `len`, `id`, `status`, and a 200-char `bodyHint`.
 ## launchd (macOS, optional)
 
 ```bash
+# copy and edit ProgramArguments / WorkingDirectory paths inside
 cp launchd.plist.example ~/Library/LaunchAgents/com.example.opencode-retry-proxy.plist
-# edit ProgramArguments / WorkingDirectory paths inside
-launchctl load ~/Library/LaunchAgents/com.example.opencode-retry-proxy.plist
+
+# register and start (modern macOS; `launchctl load` is deprecated)
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.opencode-retry-proxy.plist
+
+# verify
 launchctl list | grep opencode
+
+# unload / remove
+launchctl bootout gui/$(id -u)/com.example.opencode-retry-proxy
 ```
 
 Or use `start.sh`:

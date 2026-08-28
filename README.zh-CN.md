@@ -30,10 +30,15 @@ Reasonix / Opencode 的 Responses API 通过 `previous_response_id` 在服务端
 ## 快速开始
 
 ```bash
-node proxy.mjs &
+# 后台运行（nohup 保证 shell 退出后进程仍在）
+nohup node proxy.mjs >/dev/null 2>&1 &
 # 或带环境变量覆盖：
-LISTEN_PORT=8765 UPSTREAM=https://opencode.ai/zen/go/v1 node proxy.mjs
+LISTEN_PORT=8765 UPSTREAM=https://opencode.ai/zen/go/v1 nohup node proxy.mjs >/dev/null 2>&1 &
+# 或使用自带启动脚本：
+./start.sh
 ```
+
+> 若 `8765` 端口已被占用，代理会报错退出——用 `LISTEN_PORT` 换一个端口即可。
 
 把客户端指向代理而非直连上游：
 
@@ -57,6 +62,8 @@ tail -f /tmp/opencode-retry-proxy.log
 # retry result: 200 OK
 ```
 
+> 提示：用非法模型（`{"model":"test",...}`）打代理会返回 `ModelError: Model test is not supported`——这恰恰说明**代理已正确转发**到上游，不是故障。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -78,10 +85,17 @@ tail -f /tmp/opencode-retry-proxy.log
 ## launchd（macOS，可选）
 
 ```bash
+# 复制并编辑文件内的 ProgramArguments / WorkingDirectory 路径
 cp launchd.plist.example ~/Library/LaunchAgents/com.example.opencode-retry-proxy.plist
-# 编辑文件内的 ProgramArguments / WorkingDirectory 路径
-launchctl load ~/Library/LaunchAgents/com.example.opencode-retry-proxy.plist
+
+# 注册并启动（macOS 新版推荐；`launchctl load` 已废弃）
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.opencode-retry-proxy.plist
+
+# 验证
 launchctl list | grep opencode
+
+# 卸载 / 移除
+launchctl bootout gui/$(id -u)/com.example.opencode-retry-proxy
 ```
 
 或使用 `start.sh` 一键启动：

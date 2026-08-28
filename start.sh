@@ -18,4 +18,6 @@ sleep 1
 echo "started pid=$(cat "$PIDFILE")"
 cat "$STDOUT"
 echo "--- verify ---"
+# NOTE: a bogus model returns "ModelError: Model test is not supported" —
+# that is the proxy forwarding correctly to the upstream, NOT a failure.
 curl -s -X POST "http://127.0.0.1:${LISTEN_PORT:-8765}/v1/responses" -H 'content-type: application/json' -d '{"model":"test","input":[]}' 2>&1 | head -c 400; echo
