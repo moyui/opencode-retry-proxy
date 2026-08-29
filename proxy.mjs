@@ -15,7 +15,7 @@
 //   LISTEN_PORT        default 8765
 //   UPSTREAM           default https://opencode.ai/zen/go/v1
 //   LOG_FILE           default /tmp/opencode-retry-proxy.log
-//   MAX_HISTORY        default 300              — max stored response ids
+//   MAX_HISTORY        default 10000            — max stored response ids (refs are tiny in the shared-chain model)
 //   MAX_HISTORY_BYTES  default 268435456 (256MB) — byte budget for stored inputs
 //   MERGE_MAX_BYTES    default 4194304 (4MB)     — merged retry body cap; above it, pass the 400 through
 //   HISTORY_FILE       default /tmp/opencode-retry-proxy-history.json — disk persistence, survives restarts
@@ -28,7 +28,7 @@ const LISTEN_HOST = process.env.LISTEN_HOST || '127.0.0.1';
 const LISTEN_PORT = parseInt(process.env.LISTEN_PORT || '8765', 10);
 const UPSTREAM = process.env.UPSTREAM || 'https://opencode.ai/zen/go/v1';
 const LOG_FILE = process.env.LOG_FILE || '/tmp/opencode-retry-proxy.log';
-const MAX_HISTORY = parseInt(process.env.MAX_HISTORY || '300', 10);
+const MAX_HISTORY = parseInt(process.env.MAX_HISTORY || '10000', 10);
 const MAX_HISTORY_BYTES = parseInt(process.env.MAX_HISTORY_BYTES || String(256 * 1024 * 1024), 10);
 const MERGE_MAX_BYTES = parseInt(process.env.MERGE_MAX_BYTES || String(4 * 1024 * 1024), 10);
 const HISTORY_FILE = process.env.HISTORY_FILE || '/tmp/opencode-retry-proxy-history.json';

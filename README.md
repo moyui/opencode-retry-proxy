@@ -73,7 +73,7 @@ tail -f /tmp/opencode-retry-proxy.log
 | `LISTEN_PORT` | `8765` |  |
 | `UPSTREAM` | `https://opencode.ai/zen/go/v1` | Upstream Responses API base (should end with `/v1`). |
 | `LOG_FILE` | `/tmp/opencode-retry-proxy.log` |  |
-| `MAX_HISTORY` | `300` | Max response ids kept in memory (`respId -> input[]`). |
+| `MAX_HISTORY` | `10000` | Max response ids kept in memory (`respId -> chainId` refs are tiny in the shared-chain model). |
 | `MAX_HISTORY_BYTES` | `268435456` (256MB) | Byte budget for stored inputs; oldest entries evicted first (disk file follows the trimmed state). |
 | `MERGE_MAX_BYTES` | `4194304` (4MB) | Merged retry bodies larger than this are not sent; the upstream 400 passes through. |
 | `HISTORY_FILE` | `/tmp/opencode-retry-proxy-history.json` | Disk persistence of stored history (see Security & Privacy). |

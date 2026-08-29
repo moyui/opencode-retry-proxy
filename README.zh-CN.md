@@ -73,7 +73,7 @@ tail -f /tmp/opencode-retry-proxy.log
 | `LISTEN_PORT` | `8765` | 监听端口 |
 | `UPSTREAM` | `https://opencode.ai/zen/go/v1` | 上游 Responses API 基地址（应以 `/v1` 结尾） |
 | `LOG_FILE` | `/tmp/opencode-retry-proxy.log` | 日志文件 |
-| `MAX_HISTORY` | `300` | 内存中保留的最大响应 id 数（`respId -> input[]`） |
+| `MAX_HISTORY` | `10000` | 内存中保留的最大响应 id 数（共享链模型下 id 引用极小） |
 | `MAX_HISTORY_BYTES` | `268435456`（256MB） | 存储历史的字节预算，超限按最旧驱逐（磁盘文件随之收敛） |
 | `MERGE_MAX_BYTES` | `4194304`（4MB） | 合并重试请求体超过该值则不重发，改为原样透传上游 400 |
 | `HISTORY_FILE` | `/tmp/opencode-retry-proxy-history.json` | 历史落盘文件（见「安全与隐私」） |
