@@ -58,7 +58,8 @@ api_key_env = "CUSTOM_OPENCODE_AI_API_KEY"
 
 ```bash
 tail -f /tmp/opencode-retry-proxy.log
-# hit expired previous_response_id=resp_xxx -> retry without it (... -> ... bytes)
+# stored history resp_xxx session=c1 items=912 bytes=1897560
+# hit expired previous_response_id=resp_xxx session=c1 -> merge retry (46453 -> 1951954 bytes)
 # retry result: 200 OK
 ```
 
@@ -73,14 +74,22 @@ tail -f /tmp/opencode-retry-proxy.log
 | `UPSTREAM` | `https://opencode.ai/zen/go/v1` | 上游 Responses API 基地址（应以 `/v1` 结尾） |
 | `LOG_FILE` | `/tmp/opencode-retry-proxy.log` | 日志文件 |
 | `MAX_HISTORY` | `300` | 内存中保留的最大响应 id 数（`respId -> input[]`） |
+| `MAX_HISTORY_BYTES` | `268435456`（256MB） | 存储历史的字节预算，超限按最旧驱逐（磁盘文件随之收敛） |
+| `MERGE_MAX_BYTES` | `4194304`（4MB） | 合并重试请求体超过该值则不重发，改为原样透传上游 400 |
+| `HISTORY_FILE` | `/tmp/opencode-retry-proxy-history.json` | 历史落盘文件（见「安全与隐私」） |
 
 ## 工作原理
 
 1. 原样转发所有请求到 `UPSTREAM`（保留 `Authorization`、`content-type`、流式响应）。
-2. 若请求携带 `previous_response_id` 且上游返回 `400` 且命中 `referenced response (not found|expired)` 或 `previous_response_id not found`，则构造重试请求：去掉 `previous_response_id`、将 `input` 替换为 `history[prevId] + 当前 input`，重发一次。
-3. 通过嗅探 `application/json` 与 `text/event-stream`（SSE）响应中的 `id` 来维护 `history`，将增量 `input` 合并为完整链路，供后续重试使用。
+2. 以 `previous_response_id` 链为会话单位：每条存储的历史都带 `session=c_N` 日志标签；通过比对请求 input 首条目哈希与链首哈希，按会话识别全量重发/压缩重置（此时链内容整体替换，而非追加旧历史）。
+3. 通过嗅探 `application/json` 与 `text/event-stream`（SSE）响应中的 `id` 维护 `history`，将增量 `input` 合并为完整链路；字符串型 `input`（部分客户端使用）会规范化为单条 user message 再存储/合并。
+4. 遇到 `400 referenced response (not found|expired)` 时：
+   - **有存储历史** —— 去掉 `previous_response_id`，把 `history[prevId] + input` 合并成完整回放（为缺少 `summary` 的 reasoning item 注入 `summary: []`），重发一次；
+   - **无存储历史**（链早于代理启动、或已被驱逐）—— 兜底剥离重试保证会话存活（日志标记 `DEGRADED retry without context`，该轮可能缺少更早的上下文）；
+   - **合并后体积超过 `MERGE_MAX_BYTES`** —— 将上游 400 原样透传。
+5. 历史落盘到 `HISTORY_FILE`（防抖写入，SIGTERM/SIGINT 时同步保存），启动时恢复——重启不再导致旧链失忆。
 
-不记录敏感信息——日志仅含 `len`、`id`、`status` 与 200 字符的 `bodyHint` 截断。
+日志不含敏感信息——仅 `len`、`id`、`status` 与截断提示。
 
 ## launchd（macOS，可选）
 
@@ -108,7 +117,8 @@ launchctl bootout gui/$(id -u)/com.example.opencode-retry-proxy
 
 - 仅绑定 `127.0.0.1`，不要暴露到网络。
 - 原样转发 `Authorization` —— 能访问代理的人就能消耗你的 API 额度。
-- 内存中最多保留 `MAX_HISTORY` 份完整 `input` 数组，并在 `LOG_FILE` 追加运行日志。除截断的 `bodyHint` 外，不落盘请求体。
+- **请求体会本地落盘**：存储的历史（完整 `input`，上限 `MAX_HISTORY_BYTES`）会写入 `HISTORY_FILE`，以便代理重启后会话不失忆。请确保该文件位于私有磁盘；删除该文件即可清空已存上下文。
+- 日志仅包含长度、id、状态码与截断提示，不记录完整请求体。
 - 零依赖，仅需 Node.js `>=18`（使用原生 `fetch`）。
 
 ## 许可证
