@@ -40,10 +40,14 @@ function log(...args) {
   try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch {}
 }
 
-// respId -> { input: Array, bytes, chainId, headHash }
-// A "session" is a previous_response_id chain; every stored response carries its chainId.
-const history = new Map();
-let historyBytes = 0;
+// Session chains: one shared, mutable input array per chain; response ids are
+// tiny refs (respId -> chainId) into their chain. Memory is O(total context)
+// per session, not O(turns x context) — a 1000-turn session costs ~one chain.
+// Eviction order is global FIFO over resp ids; a chain is freed when its last
+// id is evicted.
+const chains = new Map();   // chainId -> { input: Array, headHash, bytes, refs }
+const history = new Map();  // respId -> chainId (insertion order = eviction order)
+let totalBytes = 0;
 let chainCounter = 0;
 const headIndex = new Map(); // headHash -> chainId (recent, capped) to rejoin chains on full resends
 
@@ -55,29 +59,78 @@ function headHash(input) {
 
 function newChainId() { return `c${++chainCounter}`; }
 
-function historySet(id, input, chainId) {
-  if (!chainId) chainId = newChainId();
-  let bytes = 0;
-  try { bytes = JSON.stringify(input).length; } catch { return chainId; }
-  const old = history.get(id);
-  if (old) historyBytes -= old.bytes;
-  const hh = headHash(input);
-  history.set(id, { input, bytes, chainId, headHash: hh });
-  historyBytes += bytes;
+function chainBytes(input) {
+  try { return JSON.stringify(input).length; } catch { return 0; }
+}
+
+function appendInto(arr, items) { for (const it of items) arr.push(it); }
+
+function dropOldestEntry() {
+  const oldestId = history.keys().next().value;
+  const cid = history.get(oldestId);
+  history.delete(oldestId);
+  const ch = chains.get(cid);
+  if (!ch) return;
+  ch.refs -= 1;
+  if (ch.refs <= 0) {
+    totalBytes -= ch.bytes;
+    chains.delete(cid);
+  }
+}
+
+// Record a successful response id. Decides append vs reset vs fresh-chain:
+//  - request carried previous_response_id and its chain is known: append the
+//    incremental input (or reset on full resend / compaction, detected by
+//    head-hash match against the chain head);
+//  - request has no previous_response_id (merged retry body or client full
+//    resend without chaining): the input already IS the full chain — replace;
+//  - request carried an unknown/expired prev id: start fresh chain content.
+function storeResponse(id, bodyObj, chain) {
+  const cur = normalizeInput(bodyObj);
+  if (!Array.isArray(cur)) {
+    log(`resp ${id}: input=${describeInput(bodyObj.input)}, not storable`);
+    return;
+  }
+  const hh = cur.length ? headHash(cur) : null;
+  let ch = chains.get(chain.chainId);
+  if (!bodyObj.previous_response_id) {
+    if (!ch) { ch = { input: [], headHash: null, bytes: 0, refs: 0 }; chains.set(chain.chainId, ch); }
+    const nb = chainBytes(cur);
+    totalBytes += nb - ch.bytes;
+    ch.input = cur.slice();
+    ch.headHash = hh;
+    ch.bytes = nb;
+  } else if (ch) {
+    if (hh && hh === ch.headHash) {
+      log(`session ${chain.chainId}: full resend/compaction detected (${cur.length} items), chain reset`);
+      const nb = chainBytes(cur);
+      totalBytes += nb - ch.bytes;
+      ch.input = cur.slice();
+      ch.bytes = nb;
+      ch.headHash = hh;
+    } else {
+      appendInto(ch.input, cur);
+      totalBytes += chainBytes(cur);
+      ch.bytes = chainBytes(ch.input);
+    }
+  } else {
+    ch = { input: cur.slice(), headHash: hh, bytes: 0, refs: 0 };
+    ch.bytes = chainBytes(ch.input);
+    totalBytes += ch.bytes;
+    chains.set(chain.chainId, ch);
+  }
+  history.set(id, chain.chainId);
+  ch.refs += 1;
   if (hh) {
-    headIndex.set(hh, chainId);
+    headIndex.set(hh, chain.chainId);
     while (headIndex.size > 100) headIndex.delete(headIndex.keys().next().value);
   }
-  log(`stored history ${id} session=${chainId} items=${input.length} bytes=${bytes} (entries=${history.size}, totalBytes=${historyBytes})`);
+  log(`stored history ${id} session=${chain.chainId} items=${ch.input.length} bytes=${ch.bytes} (entries=${history.size}, chains=${chains.size}, totalBytes=${totalBytes})`);
   // evict oldest while over budget; never evict the only (just-inserted) entry
-  while (history.size > 1 && (history.size > MAX_HISTORY || historyBytes > MAX_HISTORY_BYTES)) {
-    const oldestKey = history.keys().next().value;
-    const oldest = history.get(oldestKey);
-    historyBytes -= oldest.bytes;
-    history.delete(oldestKey);
+  while (history.size > 1 && (history.size > MAX_HISTORY || totalBytes > MAX_HISTORY_BYTES)) {
+    dropOldestEntry();
   }
   scheduleSave();
-  return chainId;
 }
 
 // Disk persistence: survives proxy restarts (in-memory history is lost on every
@@ -87,7 +140,7 @@ function scheduleSave() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    const data = JSON.stringify({ chainCounter, entries: [...history] });
+    const data = JSON.stringify({ v: 2, chainCounter, chains: [...chains], ids: [...history] });
     fs.writeFile(HISTORY_FILE, data, err => { if (err) log(`history save failed: ${err.message}`); });
   }, 3000);
   saveTimer.unref?.();
@@ -96,24 +149,52 @@ function scheduleSave() {
 function flushSave() {
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   try {
-    if (history.size) fs.writeFileSync(HISTORY_FILE, JSON.stringify({ chainCounter, entries: [...history] }));
+    if (chains.size) fs.writeFileSync(HISTORY_FILE, JSON.stringify({ v: 2, chainCounter, chains: [...chains], ids: [...history] }));
   } catch {}
 }
 
+function afterLoad() {
+  chainCounter = Math.max(chainCounter, chains.size);
+  totalBytes = 0;
+  for (const ch of chains.values()) totalBytes += ch.bytes;
+  while (history.size > 1 && (history.size > MAX_HISTORY || totalBytes > MAX_HISTORY_BYTES)) dropOldestEntry();
+}
+
 function loadHistory() {
-  try {
-    const data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8'));
-    if (!data || !Array.isArray(data.entries)) return;
-    for (const [id, e] of data.entries) {
-      if (e && Array.isArray(e.input) && Number.isFinite(e.bytes) && e.chainId) {
-        history.set(id, e);
-        historyBytes += e.bytes;
-        if (e.headHash) headIndex.set(e.headHash, e.chainId);
+  let data;
+  try { data = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); } catch { return; }
+  if (data && data.v === 2 && Array.isArray(data.chains)) {
+    for (const [cid, ch] of data.chains) {
+      if (ch && Array.isArray(ch.input)) {
+        chains.set(cid, { input: ch.input, headHash: ch.headHash || null, bytes: chainBytes(ch.input), refs: 0 });
+        if (ch.headHash) headIndex.set(ch.headHash, cid);
       }
     }
-    chainCounter = Number.isFinite(data.chainCounter) ? data.chainCounter : history.size;
-    log(`restored ${history.size} history entries from ${HISTORY_FILE} (totalBytes=${historyBytes})`);
-  } catch { /* no file yet or corrupt — start fresh */ }
+    for (const [id, cid] of data.ids || []) {
+      if (chains.has(cid)) { history.set(id, cid); chains.get(cid).refs += 1; }
+    }
+    chainCounter = Number.isFinite(data.chainCounter) ? data.chainCounter : 0;
+    afterLoad();
+    log(`restored ${history.size} ids across ${chains.size} sessions from ${HISTORY_FILE} (totalBytes=${totalBytes})`);
+    return;
+  }
+  if (data && Array.isArray(data.entries)) {
+    // v1 migration: one full-input copy per id; the latest entry per chain is the chain content
+    const latest = new Map();
+    for (const [id, e] of data.entries) {
+      if (e && Array.isArray(e.input) && e.chainId) latest.set(e.chainId, { id, e });
+    }
+    for (const [cid, { e }] of latest) {
+      chains.set(cid, { input: e.input, headHash: e.headHash || null, bytes: chainBytes(e.input), refs: 0 });
+      if (e.headHash) headIndex.set(e.headHash, cid);
+    }
+    for (const [id, e] of data.entries) {
+      if (e && e.chainId && chains.has(e.chainId)) { history.set(id, e.chainId); chains.get(e.chainId).refs += 1; }
+    }
+    chainCounter = Number.isFinite(data.chainCounter) ? data.chainCounter : 0;
+    afterLoad();
+    log(`migrated v1 history: ${history.size} ids across ${chains.size} sessions (totalBytes=${totalBytes})`);
+  }
 }
 
 function isExpiredError(status, bodyText) {
@@ -151,43 +232,24 @@ function normalizeInput(bodyObj) {
 function resolveChain(bodyObj) {
   const cur = normalizeInput(bodyObj);
   const hh = Array.isArray(cur) && cur.length ? headHash(cur) : null;
-  const prevEntry = bodyObj.previous_response_id ? history.get(bodyObj.previous_response_id) : null;
-  let chainId = null;
-  if (prevEntry) chainId = prevEntry.chainId;
-  else if (hh && headIndex.has(hh)) chainId = headIndex.get(hh);
-  return { chainId: chainId || newChainId(), prevEntry, hh };
+  const prevChainId = bodyObj.previous_response_id ? history.get(bodyObj.previous_response_id) : null;
+  const prevChain = prevChainId ? chains.get(prevChainId) : null;
+  const chainId = prevChainId || (hh ? headIndex.get(hh) : null) || newChainId();
+  return { chainId, prevChain, hh };
 }
 
-// Full chain for storage. On the retry path bodyObj is already the merged body
-// (no previous_response_id), so its input is used as-is. If the client resent
-// the full history (head hash equals the chain head — e.g. after compaction or
-// client-side recovery), the chain content is replaced instead of appended.
-function fullInputFor(bodyObj, chain) {
-  const cur = normalizeInput(bodyObj);
-  if (!Array.isArray(cur)) return null;
-  const hh = cur.length ? headHash(cur) : null;
-  if (bodyObj.previous_response_id && chain.prevEntry && Array.isArray(chain.prevEntry.input)) {
-    if (hh && hh === chain.prevEntry.headHash) {
-      log(`session ${chain.chainId}: full resend/compaction detected (${cur.length} items), chain reset`);
-      return cur;
-    }
-    return [...chain.prevEntry.input, ...cur];
-  }
-  return cur;
-}
-
-// Build the retry body: strip previous_response_id, merge stored history into
-// input (unless the request is itself a full resend), sanitize reasoning items.
-// Returns null when we cannot reconstruct the full context or the merged body
-// exceeds MERGE_MAX_BYTES (the upstream 400 is then passed through unchanged).
+// Build the retry body: strip previous_response_id, merge the chain's full
+// history into input (unless the request is itself a full resend), sanitize
+// reasoning items. Returns null when we cannot reconstruct the full context or
+// the merged body exceeds MERGE_MAX_BYTES (the 400 is then passed through).
 function buildRetryBody(bodyObj, chain) {
-  const entry = chain.prevEntry;
+  const prevChain = chain.prevChain;
   const cur = normalizeInput(bodyObj);
-  if (!entry || !Array.isArray(entry.input) || !Array.isArray(cur)) return null;
+  if (!prevChain || !Array.isArray(prevChain.input) || !Array.isArray(cur)) return null;
   const hh = cur.length ? headHash(cur) : null;
-  const resend = hh && hh === entry.headHash;
+  const resend = hh && hh === prevChain.headHash;
   if (resend) log(`session ${chain.chainId}: full resend/compaction detected on retry, using resend input as-is (${cur.length} items)`);
-  const mergedInput = resend ? cur : [...entry.input, ...cur];
+  const mergedInput = resend ? cur : [...prevChain.input, ...cur];
   const merged = { ...bodyObj, input: sanitizeReasoning(mergedInput) };
   delete merged.previous_response_id;
   let size = 0;
@@ -280,7 +342,7 @@ async function handle(req, res) {
       try { bodyTextForCheck = await upstreamResp.clone().text(); } catch {}
       if (isExpiredError(upstreamResp.status, bodyTextForCheck)) {
         const merged = buildRetryBody(bodyObj, chain);
-        const reconstructable = chain.prevEntry && Array.isArray(chain.prevEntry.input) && Array.isArray(normalizeInput(bodyObj));
+        const reconstructable = chain.prevChain && Array.isArray(chain.prevChain.input) && Array.isArray(normalizeInput(bodyObj));
         if (merged || !reconstructable) {
           const retryBodyObj = merged || (() => { const { previous_response_id, ...rest } = bodyObj; return rest; })();
           const retryText = JSON.stringify(retryBodyObj);
@@ -325,9 +387,7 @@ async function handle(req, res) {
       res.end(text);
       const j = tryJson(text);
       if (j && j.id && bodyObj) {
-        const fi = fullInputFor(bodyObj, chain);
-        if (fi) historySet(j.id, fi, chain.chainId);
-        else log(`json resp ${j.id}: input=${describeInput(bodyObj.input)}, not storable`);
+        storeResponse(j.id, bodyObj, chain);
       } else if (!(j && j.id)) {
         log(`json resp has no id, hint=${text.slice(0, 200)}`);
       }
@@ -346,14 +406,8 @@ async function handle(req, res) {
             if (buffer.length > SSE_SNIFF_WINDOW) buffer = buffer.slice(-SSE_SNIFF_WINDOW);
             const m = buffer.match(SSE_ID_RE);
             if (m && bodyObj) {
-              const fi = fullInputFor(bodyObj, chain);
-              if (fi) {
-                historySet(m[1], fi, chain.chainId);
-                stored = true;
-              } else {
-                log(`sse resp ${m[1]}: input=${describeInput(bodyObj.input)}, not storable`);
-                stored = true;
-              }
+              storeResponse(m[1], bodyObj, chain);
+              stored = true;
             }
           }
         }
