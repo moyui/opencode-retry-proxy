@@ -94,6 +94,7 @@ tail -f /tmp/opencode-retry-proxy.log
    - **合并后体积超过 `MERGE_MAX_BYTES`** —— 将上游 400 原样透传。
 5. 历史落盘到 `HISTORY_FILE`（防抖写入，SIGTERM/SIGINT 时同步保存），启动时恢复——重启不再导致旧链失忆。
 6. 自愈上下文超限：muse 把上下文超限报成通用 `400 invalid_request_error: The request contains invalid parameters`。当估算 token 数超过 `CTX_MIN_SUSPECT_TOKENS` 的请求收到此类 400 时，代理将 input 压缩到 `CTX_MAX_TOKENS`——保留头部（系统/任务上下文，`CTX_HEAD_TOKENS`）与最近尾部、丢弃中间，并保持 `function_call`/`function_call_output` 成对——先按预算重发一次，再按 70% 预算重试一次。日志标记 `context overflow suspected ... compacting N -> M items`。代价：模型不再看到被丢弃的中间旧上下文（较早的轮次）；客户端自身保存的会话不受影响。
+7. 所有上游请求（首次转发、过期合并重试、压缩重试）都做**网络瞬时故障重试**：Node fetch 在连接重置 / 陈旧 keep-alive 时会抛 `fetch failed`，代理最多重试 3 次（短退避）才报错。避免上游抖动时合并重试失败导致 turn 死掉。
 
 日志不含敏感信息——仅 `len`、`id`、`status` 与截断提示。
 

@@ -375,6 +375,24 @@ async function doFetch(targetUrl, method, headers, bodyBuf) {
   return fetch(targetUrl, opts);
 }
 
+// Retry transient network failures (Node fetch throws "fetch failed" on
+// connection resets / stale keep-alive). HTTP error statuses return normally
+// and are NOT retried here. A retry carrying the same previous_response_id may
+// hit "referenced response not found or expired" if the first attempt consumed
+// the chain — the merge path then reconstructs the full context.
+async function fetchWithRetry(targetUrl, method, headers, bodyBuf, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await doFetch(targetUrl, method, headers, bodyBuf);
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) await new Promise(r => setTimeout(r, 300 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 const SSE_ID_RE = /"(?:id|response_id)"\s*:\s*"(resp_[^"]+)"/;
 const SSE_SNIFF_WINDOW = 64 * 1024;
 
@@ -414,7 +432,7 @@ async function handle(req, res) {
 
     let upstreamResp;
     try {
-      upstreamResp = await doFetch(targetUrl, req.method, fwdHeaders, effectiveRawBody.length ? effectiveRawBody : undefined);
+      upstreamResp = await fetchWithRetry(targetUrl, req.method, fwdHeaders, effectiveRawBody.length ? effectiveRawBody : undefined);
     } catch (e) {
       log(`upstream fetch failed ${targetUrl}: ${e.message}`);
       res.writeHead(502, { 'content-type': 'application/json' });
@@ -445,7 +463,7 @@ async function handle(req, res) {
             log(`hit expired previous_response_id=${bodyObj.previous_response_id} session=${chain.chainId} but no stored history -> DEGRADED retry without context (input=${describeInput(bodyObj.input)})`);
           }
           try {
-            const retryResp = await doFetch(targetUrl, req.method, retryHeaders, retryBody);
+            const retryResp = await fetchWithRetry(targetUrl, req.method, retryHeaders, retryBody);
             let retryTextCheck = '';
             try { retryTextCheck = await retryResp.clone().text(); } catch {}
             if (!isExpiredError(retryResp.status, retryTextCheck)) {
@@ -484,7 +502,7 @@ async function handle(req, res) {
           const retryHeaders = { ...fwdHeaders, 'content-type': 'application/json' };
           log(`session ${chain.chainId}: context overflow suspected (est=${origEst} tokens), compacting ${bodyObj.input.length} -> ${compacted.length} items (est=${Math.round(estimateInputTokens(compacted))}), retry budget ${budget}`);
           try {
-            const retryResp = await doFetch(targetUrl, req.method, retryHeaders, retryBody);
+            const retryResp = await fetchWithRetry(targetUrl, req.method, retryHeaders, retryBody);
             let retryCheck = '';
             try { retryCheck = await retryResp.clone().text(); } catch {}
             if (retryResp.status === 400) {

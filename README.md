@@ -94,6 +94,7 @@ tail -f /tmp/opencode-retry-proxy.log
    - **merged body over `MERGE_MAX_BYTES`** — the upstream 400 is passed through unchanged.
 5. Persists history to `HISTORY_FILE` (debounced, flushed on SIGTERM/SIGINT) and restores it at startup, so restarts don't amnesia previously-alive chains.
 6. Self-heals context overflow: muse reports context-length overflow as a generic `400 invalid_request_error: The request contains invalid parameters`. When that 400 arrives on a request estimated above `CTX_MIN_SUSPECT_TOKENS`, the proxy compacts the input to `CTX_MAX_TOKENS` — keeping the head (task/system context, `CTX_HEAD_TOKENS`) and the recent tail, dropping the middle, keeping `function_call`/`function_call_output` pairs atomic — and retries once, then again at 70% of the budget. Logged as `context overflow suspected ... compacting N -> M items`. Trade-off: the model no longer sees the dropped middle context (older turns); the client's stored session is unaffected.
+7. Retries transient network failures on every upstream fetch (forward, expired-id merge retry, compaction retry): Node fetch throws `fetch failed` on connection resets / stale keep-alive, and the proxy retries up to 3 times with a short backoff before surfacing an error. This keeps an otherwise-healthy turn from dying when the upstream blips while a merge retry is in flight.
 
 No secrets are logged — only `len`, `id`, `status`, and truncated hints.
 
