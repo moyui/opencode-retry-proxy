@@ -34,6 +34,17 @@ const MERGE_MAX_BYTES = parseInt(process.env.MERGE_MAX_BYTES || String(4 * 1024 
 const HISTORY_FILE = process.env.HISTORY_FILE || '/tmp/opencode-retry-proxy-history.json';
 const MODEL_ALIAS = { 'muse-spark-1.2-retry': 'muse-spark-1.2-contributor' };
 
+// Context-overflow self-heal. muse reports context-length overflow as a generic
+// 400 "invalid_request_error: The request contains invalid parameters" (no
+// "context length exceeded" wording), which is indistinguishable from a
+// malformed body by message alone. For large requests we estimate input tokens;
+// on such a 400 we compact the input (keep head task context + recent tail,
+// drop the middle, preserve function_call/output pairing) and retry, then again
+// at 70% budget. Set CTX_MAX_TOKENS=0 to disable.
+const CTX_MAX_TOKENS = parseInt(process.env.CTX_MAX_TOKENS || '750000', 10);
+const CTX_HEAD_TOKENS = parseInt(process.env.CTX_HEAD_TOKENS || '20000', 10);
+const CTX_MIN_SUSPECT_TOKENS = parseInt(process.env.CTX_MIN_SUSPECT_TOKENS || '400000', 10);
+
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.join(' ')}`;
   console.log(line);
@@ -204,6 +215,86 @@ function isExpiredError(status, bodyText) {
   return t.includes('referenced response not found') || (t.includes('referenced response') && t.includes('expired')) || (t.includes('previous_response_id') && t.includes('not found'));
 }
 
+// Rough token estimate: CJK ≈ 1 token/char, other chars ≈ 0.3. Calibrated so
+// the observed muse limit (~870k est tokens) sits well below the 1M configured
+// context_window; the budget is in the same units so the margin holds even if
+// the absolute accuracy is poor.
+function estTokens(s) {
+  if (typeof s !== 'string' || !s.length) return 0;
+  const cjk = (s.match(/[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]/g) || []).length;
+  return cjk + (s.length - cjk) * 0.3;
+}
+
+function itemTokens(it) {
+  if (!it || typeof it !== 'object') return 0;
+  let n = 0;
+  if (typeof it.arguments === 'string') n += estTokens(it.arguments);
+  if (typeof it.output === 'string') n += estTokens(it.output);
+  if (typeof it.content === 'string') n += estTokens(it.content);
+  if (Array.isArray(it.content)) for (const p of it.content) if (p && typeof p.text === 'string') n += estTokens(p.text);
+  return n + 4; // per-item JSON overhead
+}
+
+function estimateInputTokens(input) {
+  return Array.isArray(input) ? input.reduce((a, it) => a + itemTokens(it), 0) : 0;
+}
+
+// Keep the head (task/system context) and the recent tail, drop the middle, so
+// the model keeps both the original task and the latest state. function_call /
+// function_call_output pairs are kept atomic (a kept output needs its call and
+// vice versa) to avoid muse's call_id mismatch errors. Returns the original
+// array when it cannot meaningfully shrink.
+function compactForBudget(input, budget) {
+  const toks = input.map(itemTokens);
+  const total = toks.reduce((a, b) => a + b, 0);
+  if (total <= budget) return input;
+
+  let h = 0, headSum = 0;
+  while (h < input.length && headSum + toks[h] <= CTX_HEAD_TOKENS) { headSum += toks[h]; h++; }
+  if (h >= input.length) return input;
+
+  let K = input.length, tailSum = 0;
+  const tailBudget = Math.max(0, budget - headSum);
+  while (K > h && tailSum + toks[K - 1] <= tailBudget) { tailSum += toks[K - 1]; K--; }
+  if (K <= h) return input;
+
+  const fcIndex = new Map();
+  const fcoIndex = new Map();
+  input.forEach((it, i) => {
+    if (it && it.type === 'function_call' && it.call_id) fcIndex.set(it.call_id, i);
+    if (it && it.type === 'function_call_output' && it.call_id && !fcoIndex.has(it.call_id)) fcoIndex.set(it.call_id, i);
+  });
+  let changed = true, guard = 0;
+  while (changed && guard++ < 5000) {
+    changed = false;
+    for (let i = 0; i < h; i++) {
+      const it = input[i];
+      if (it && it.type === 'function_call' && it.call_id) {
+        const oi = fcoIndex.get(it.call_id);
+        if (oi !== undefined && oi >= h) { h = Math.min(input.length, oi + 1); changed = true; }
+      }
+    }
+    for (let j = K; j < input.length; j++) {
+      const it = input[j];
+      if (it && it.type === 'function_call_output' && it.call_id) {
+        const fi = fcIndex.get(it.call_id);
+        if (fi !== undefined && fi < K) { K = fi; changed = true; }
+      }
+    }
+    if (h >= K) return input;
+  }
+  if (K - h < 1) return input;
+  return [...input.slice(0, h), ...input.slice(K)];
+}
+
+function isOverflowSuspect(status, bodyText, input) {
+  if (status !== 400 || !Array.isArray(input) || !input.length) return false;
+  if (isExpiredError(status, bodyText)) return false;
+  const t = (bodyText || '').toLowerCase();
+  if (!(t.includes('invalid_request_error') || t.includes('invalid parameters'))) return false;
+  return estimateInputTokens(input) > CTX_MIN_SUSPECT_TOKENS;
+}
+
 function tryJson(s) { try { return JSON.parse(s); } catch { return null; } }
 
 // Reasoning items replayed from history must carry `summary`, otherwise the
@@ -370,6 +461,45 @@ async function handle(req, res) {
           }
         } else {
           log(`hit expired previous_response_id=${bodyObj.previous_response_id} session=${chain.chainId}: merged body too large or unstorable -> passing upstream ${upstreamResp.status} through`);
+        }
+      }
+    }
+
+    // Self-heal context overflow: muse reports context-length overflow as a
+    // generic invalid_request_error. For large inputs, compact (keep head task
+    // context + recent tail, drop the middle, preserve call/output pairing)
+    // and retry at CTX_MAX_TOKENS, then at 70% of it. On success the turn keeps
+    // running with reduced (older) context instead of dying on a 400.
+    if (bodyObj && Array.isArray(bodyObj.input) && CTX_MAX_TOKENS > 0) {
+      let bodyTextForOverflow = '';
+      try { bodyTextForOverflow = await upstreamResp.clone().text(); } catch {}
+      if (isOverflowSuspect(upstreamResp.status, bodyTextForOverflow, bodyObj.input)) {
+        const origEst = Math.round(estimateInputTokens(bodyObj.input));
+        for (const budget of [CTX_MAX_TOKENS, Math.round(CTX_MAX_TOKENS * 0.7)]) {
+          const compacted = compactForBudget(bodyObj.input, budget);
+          if (!compacted || compacted.length >= bodyObj.input.length) break;
+          const retryBodyObj = { ...bodyObj, input: compacted };
+          const retryText = JSON.stringify(retryBodyObj);
+          const retryBody = Buffer.from(retryText);
+          const retryHeaders = { ...fwdHeaders, 'content-type': 'application/json' };
+          log(`session ${chain.chainId}: context overflow suspected (est=${origEst} tokens), compacting ${bodyObj.input.length} -> ${compacted.length} items (est=${Math.round(estimateInputTokens(compacted))}), retry budget ${budget}`);
+          try {
+            const retryResp = await doFetch(targetUrl, req.method, retryHeaders, retryBody);
+            let retryCheck = '';
+            try { retryCheck = await retryResp.clone().text(); } catch {}
+            if (retryResp.status === 400) {
+              log(`compaction retry still 400 (budget ${budget}), ${retryCheck.slice(0, 200)}`);
+              upstreamResp = retryResp;
+              continue;
+            }
+            log(`compaction retry result: ${retryResp.status} ${retryResp.statusText}`);
+            upstreamResp = retryResp;
+            bodyObj = retryBodyObj;
+            break;
+          } catch (e) {
+            log(`compaction retry fetch failed: ${e.message}`);
+            break;
+          }
         }
       }
     }

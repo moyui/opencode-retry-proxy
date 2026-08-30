@@ -12,6 +12,8 @@
 
 当上游返回 `400 referenced response not found or expired` 时，代理会自动去掉 `previous_response_id`、合并该 id 对应的全量历史 `input`，重发一次。成功后会话无感续接，无需改客户端。
 
+它还自愈**上下文长度超限**：muse 超限时报的是通用 `400 invalid_request_error: The request contains invalid parameters`（不带 "context length exceeded" 字样）。对超大请求，代理会估算输入 token 数，并在收到此类 400 时压缩 input（保留头部系统/任务上下文 + 尾部最近内容，丢弃中间，并保持 `function_call`/`function_call_output` 成对），随后重发——turn 用缩减后的旧上下文继续，而不是直接死掉。
+
 ## 为什么需要它
 
 Reasonix / Opencode 的 Responses API 通过 `previous_response_id` 在服务端串联多轮会话。如果上游因空闲超时、滚动窗口或发版把该 id 回收，后续每一轮都会失败：
@@ -76,6 +78,9 @@ tail -f /tmp/opencode-retry-proxy.log
 | `MAX_HISTORY` | `10000` | 内存中保留的最大响应 id 数（共享链模型下 id 引用极小） |
 | `MAX_HISTORY_BYTES` | `268435456`（256MB） | 存储历史的字节预算，超限按最旧驱逐（磁盘文件随之收敛） |
 | `MERGE_MAX_BYTES` | `4194304`（4MB） | 合并重试请求体超过该值则不重发，改为原样透传上游 400 |
+| `CTX_MAX_TOKENS` | `750000` | 上下文超源自愈的 token 预算，压缩后 input 目标不超过该值（需低于模型真实上限；设为 `0` 关闭该功能） |
+| `CTX_HEAD_TOKENS` | `20000` | 压缩时始终保留的 input 头部 token 数（系统/任务上下文） |
+| `CTX_MIN_SUSPECT_TOKENS` | `400000` | 仅当请求估算 token 数超过该值才尝试自愈，避免误伤小请求的真实错误 |
 | `HISTORY_FILE` | `/tmp/opencode-retry-proxy-history.json` | 历史落盘文件（见「安全与隐私」） |
 
 ## 工作原理
@@ -88,6 +93,7 @@ tail -f /tmp/opencode-retry-proxy.log
    - **无存储历史**（链早于代理启动、或已被驱逐）—— 兜底剥离重试保证会话存活（日志标记 `DEGRADED retry without context`，该轮可能缺少更早的上下文）；
    - **合并后体积超过 `MERGE_MAX_BYTES`** —— 将上游 400 原样透传。
 5. 历史落盘到 `HISTORY_FILE`（防抖写入，SIGTERM/SIGINT 时同步保存），启动时恢复——重启不再导致旧链失忆。
+6. 自愈上下文超限：muse 把上下文超限报成通用 `400 invalid_request_error: The request contains invalid parameters`。当估算 token 数超过 `CTX_MIN_SUSPECT_TOKENS` 的请求收到此类 400 时，代理将 input 压缩到 `CTX_MAX_TOKENS`——保留头部（系统/任务上下文，`CTX_HEAD_TOKENS`）与最近尾部、丢弃中间，并保持 `function_call`/`function_call_output` 成对——先按预算重发一次，再按 70% 预算重试一次。日志标记 `context overflow suspected ... compacting N -> M items`。代价：模型不再看到被丢弃的中间旧上下文（较早的轮次）；客户端自身保存的会话不受影响。
 
 日志不含敏感信息——仅 `len`、`id`、`status` 与截断提示。
 

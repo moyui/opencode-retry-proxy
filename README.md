@@ -12,6 +12,8 @@ Transparent local retry proxy for `opencode.ai/zen` Responses API `previous_resp
 
 When the upstream returns `400 referenced response not found or expired`, the proxy strips `previous_response_id`, merges the stored full history for that id, and retries once. On success the session continues transparently — no client changes needed.
 
+It also self-heals **context-length overflow**: muse reports it as a generic `400 invalid_request_error: The request contains invalid parameters` (no "context length exceeded" wording). For large requests the proxy estimates input tokens and, on such a 400, compacts the input (keeps the head task/system context + recent tail, drops the middle, keeps `function_call`/`function_call_output` pairs atomic) and retries — the turn keeps running with reduced older context instead of dying.
+
 ## Why
 
 Reasonix / Opencode's Responses API chains turns server-side via `previous_response_id`. If the upstream evicts that id (idle timeout / rolling window / deploy), every subsequent turn fails with:
@@ -76,6 +78,9 @@ tail -f /tmp/opencode-retry-proxy.log
 | `MAX_HISTORY` | `10000` | Max response ids kept in memory (`respId -> chainId` refs are tiny in the shared-chain model). |
 | `MAX_HISTORY_BYTES` | `268435456` (256MB) | Byte budget for stored inputs; oldest entries evicted first (disk file follows the trimmed state). |
 | `MERGE_MAX_BYTES` | `4194304` (4MB) | Merged retry bodies larger than this are not sent; the upstream 400 passes through. |
+| `CTX_MAX_TOKENS` | `750000` | Token budget for the context-overflow self-heal; compacted inputs target ≤ this (tune below the model's actual limit; `0` disables the feature). |
+| `CTX_HEAD_TOKENS` | `20000` | Tokens always kept from the start of the input (system/task context) during compaction. |
+| `CTX_MIN_SUSPECT_TOKENS` | `400000` | Only attempt the self-heal when the request's estimated tokens exceed this, so small genuine-error requests are never touched. |
 | `HISTORY_FILE` | `/tmp/opencode-retry-proxy-history.json` | Disk persistence of stored history (see Security & Privacy). |
 
 ## How it works
@@ -88,6 +93,7 @@ tail -f /tmp/opencode-retry-proxy.log
    - **without stored history** (chain predates proxy start, or evicted) — last-resort strip-and-retry so the session survives (`DEGRADED retry without context` in the log; that turn may lack older context);
    - **merged body over `MERGE_MAX_BYTES`** — the upstream 400 is passed through unchanged.
 5. Persists history to `HISTORY_FILE` (debounced, flushed on SIGTERM/SIGINT) and restores it at startup, so restarts don't amnesia previously-alive chains.
+6. Self-heals context overflow: muse reports context-length overflow as a generic `400 invalid_request_error: The request contains invalid parameters`. When that 400 arrives on a request estimated above `CTX_MIN_SUSPECT_TOKENS`, the proxy compacts the input to `CTX_MAX_TOKENS` — keeping the head (task/system context, `CTX_HEAD_TOKENS`) and the recent tail, dropping the middle, keeping `function_call`/`function_call_output` pairs atomic — and retries once, then again at 70% of the budget. Logged as `context overflow suspected ... compacting N -> M items`. Trade-off: the model no longer sees the dropped middle context (older turns); the client's stored session is unaffected.
 
 No secrets are logged — only `len`, `id`, `status`, and truncated hints.
 
